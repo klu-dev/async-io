@@ -121,12 +121,40 @@ impl Reactor {
                 registration: raw,
                 key,
                 state: Default::default(),
+                #[cfg(windows)]
+                wake_mode: WakeMode::Level,
             });
             sources.insert(source.clone());
             source
         };
 
         // Register the file descriptor.
+        if let Err(err) = source.registration.add(&self.poller, source.key) {
+            let mut sources = self.sources.lock().unwrap();
+            sources.remove(source.key);
+            return Err(err);
+        }
+
+        Ok(source)
+    }
+
+    /// Registers an I/O source with `WakeMode::Edge` semantics. Windows-only:
+    /// edge-triggered readiness only matters for IOCP-backed sources (named pipes).
+    #[cfg(windows)]
+    pub(crate) fn insert_io_edge(&self, raw: Registration) -> io::Result<Arc<Source>> {
+        let source = {
+            let mut sources = self.sources.lock().unwrap();
+            let key = sources.vacant_entry().key();
+            let source = Arc::new(Source {
+                registration: raw,
+                key,
+                state: Default::default(),
+                wake_mode: WakeMode::Edge,
+            });
+            sources.insert(source.clone());
+            source
+        };
+
         if let Err(err) = source.registration.add(&self.poller, source.key) {
             let mut sources = self.sources.lock().unwrap();
             sources.remove(source.key);
@@ -323,6 +351,10 @@ impl ReactorLock<'_> {
                         for &(dir, emitted) in &[(WRITE, ev.writable), (READ, ev.readable)] {
                             if emitted {
                                 state[dir].tick = tick;
+                                // Monotonic per-direction delivery counter. Used by `WakeMode::Edge`
+                                // sources to detect delivery without depending on the global ticker,
+                                // which can alias across same-cycle race windows.
+                                state[dir].events = state[dir].events.wrapping_add(1);
                                 state[dir].drain_into(&mut wakers);
                             }
                         }
@@ -373,6 +405,29 @@ enum TimerOp {
     Remove(Instant, usize),
 }
 
+/// Indicates how a `Source` reports readiness in `Source::poll_ready()`.
+///
+/// On non-Windows targets every source is implicitly `Level` and the variant
+/// is supplied by `Source::wake_mode()` without storing a per-source field.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum WakeMode {
+    /// Events are reported as long as the underlying source is ready (sockets on epoll/kqueue,
+    /// the default for this crate). Readiness uses the global reactor tick: a freshly registered
+    /// poller becomes ready when the source's `tick` advances past the value captured at
+    /// registration.
+    Level,
+
+    /// Events are delivered exactly once per readiness transition (Windows IOCP completion
+    /// packets for named pipes). Readiness uses a per-direction monotonic delivery counter
+    /// (`Direction::events`) instead of the global reactor tick. The counter is incremented only
+    /// by `ReactorLock::react()` on actual delivery, so it cannot alias with other reactor work
+    /// in the same cycle the way `tick` can.
+    ///
+    /// Only constructible on Windows; non-Windows code paths cannot observe this variant.
+    #[cfg(windows)]
+    Edge,
+}
+
 /// A registered source of I/O events.
 #[derive(Debug)]
 pub(crate) struct Source {
@@ -384,6 +439,12 @@ pub(crate) struct Source {
 
     /// Inner state with registered wakers.
     state: Mutex<[Direction; 2]>,
+
+    /// Indicates how I/O events are emitted for this source. Only stored on
+    /// Windows where IOCP-backed sources may opt into edge-triggered semantics;
+    /// on other platforms every source is `WakeMode::Level` so the field is elided.
+    #[cfg(windows)]
+    wake_mode: WakeMode,
 }
 
 /// A read or write direction.
@@ -392,8 +453,15 @@ struct Direction {
     /// Last reactor tick that delivered an event.
     tick: usize,
 
-    /// Ticks remembered by `Async::poll_readable()` or `Async::poll_writable()`.
+    /// Monotonic count of events delivered for this direction by `ReactorLock::react()`.
+    /// Used by `WakeMode::Edge` to detect delivery race-free.
+    events: u64,
+
+    /// Ticks remembered by `Async::poll_readable()` or `Async::poll_writable()` (level mode).
     ticks: Option<(usize, usize)>,
+
+    /// Event count remembered by `Async::poll_readable()` or `Async::poll_writable()` (edge mode).
+    captured_events: Option<u64>,
 
     /// Waker stored by `Async::poll_readable()` or `Async::poll_writable()`.
     waker: Option<Waker>,
@@ -424,6 +492,20 @@ impl Direction {
 }
 
 impl Source {
+    /// Returns the wake mode for this source. Always `Level` on non-Windows targets;
+    /// the per-source field only exists on Windows (see [`Source::wake_mode`]).
+    #[inline]
+    fn wake_mode(&self) -> WakeMode {
+        #[cfg(windows)]
+        {
+            self.wake_mode
+        }
+        #[cfg(not(windows))]
+        {
+            WakeMode::Level
+        }
+    }
+
     /// Polls the I/O source for readability.
     pub(crate) fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_ready(READ, cx)
@@ -440,14 +522,11 @@ impl Source {
     fn poll_ready(&self, dir: usize, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut state = self.state.lock().unwrap();
 
-        // Check if the reactor has delivered an event.
-        if let Some((a, b)) = state[dir].ticks {
-            // If `state[dir].tick` has changed to a value other than the old reactor tick,
-            // that means a newer reactor tick has delivered an event.
-            if state[dir].tick != a && state[dir].tick != b {
-                state[dir].ticks = None;
-                return Poll::Ready(Ok(()));
-            }
+        // Check if the reactor has delivered an event since registration.
+        if Self::check_ready(&state[dir], self.wake_mode()) {
+            state[dir].ticks = None;
+            state[dir].captured_events = None;
+            return Poll::Ready(Ok(()));
         }
 
         let was_empty = state[dir].is_empty();
@@ -462,7 +541,7 @@ impl Source {
             panic::catch_unwind(|| w.wake()).ok();
         }
         state[dir].waker = Some(cx.waker().clone());
-        state[dir].ticks = Some((Reactor::get().ticker(), state[dir].tick));
+        Self::capture(&mut state[dir], self.wake_mode());
 
         // Update interest in this I/O handle.
         if was_empty {
@@ -503,12 +582,69 @@ impl Source {
 
     /// Waits until the I/O source is readable or writable.
     fn ready<H: Borrow<crate::Async<T>> + Clone, T>(handle: H, dir: usize) -> Ready<H, T> {
+        let wake_mode = handle.borrow().source.wake_mode();
         Ready {
             handle,
+            wake_mode,
             dir,
             ticks: None,
+            captured_events: None,
             index: None,
             _capture: PhantomData,
+        }
+    }
+
+    pub(crate) fn registration(&self) -> &Registration {
+        &self.registration
+    }
+
+    /// Returns `true` if a delivery has occurred since the last `capture` call on this direction.
+    ///
+    /// `WakeMode::Level` decision table — `(a, b) = dir.ticks` (captured at registration:
+    /// `a` = reactor ticker snapshot, `b` = `dir.tick` snapshot), `t = dir.tick` now:
+    ///
+    /// | `dir.ticks`      | `t == a` | `t == b` | ready? | rationale                        |
+    /// |------------------|----------|----------|--------|----------------------------------|
+    /// | `None`           | —        | —        | false  | never registered                 |
+    /// | `Some((a, b))`   | true     | —        | false  | tick aliases reactor ticker only |
+    /// | `Some((a, b))`   | —        | true     | false  | tick unchanged since registration|
+    /// | `Some((a, b))`   | false    | false    | true   | direction tick advanced          |
+    ///
+    /// `WakeMode::Edge` uses the per-direction monotonic `events` counter exclusively (only
+    /// bumped by `ReactorLock::react()` on actual delivery): ready iff `dir.events !=
+    /// dir.captured_events`. This avoids the level-mode same-cycle aliasing race where
+    /// `dir.tick == a` without any actual delivery for this direction (which would otherwise
+    /// cause spurious `Ready` returns and, in tight drain loops like
+    /// `NamedPipeStream::poll_read`, an infinite busy-loop).
+    fn check_ready(dir: &Direction, mode: WakeMode) -> bool {
+        match mode {
+            WakeMode::Level => {
+                if let Some((a, b)) = dir.ticks {
+                    dir.tick != a && dir.tick != b
+                } else {
+                    false
+                }
+            }
+            #[cfg(windows)]
+            WakeMode::Edge => match dir.captured_events {
+                Some(captured) => dir.events != captured,
+                None => false,
+            },
+        }
+    }
+
+    /// Records the state needed by `check_ready` to detect future delivery.
+    fn capture(dir: &mut Direction, mode: WakeMode) {
+        match mode {
+            WakeMode::Level => {
+                dir.ticks = Some((Reactor::get().ticker(), dir.tick));
+                dir.captured_events = None;
+            }
+            #[cfg(windows)]
+            WakeMode::Edge => {
+                dir.captured_events = Some(dir.events);
+                dir.ticks = None;
+            }
         }
     }
 }
@@ -599,8 +735,12 @@ impl<T> fmt::Debug for WritableOwned<T> {
 
 struct Ready<H: Borrow<crate::Async<T>>, T> {
     handle: H,
+    wake_mode: WakeMode,
     dir: usize,
+    /// Captured `(reactor_tick, dir_tick)` pair for `WakeMode::Level`.
     ticks: Option<(usize, usize)>,
+    /// Captured per-direction event counter for `WakeMode::Edge`.
+    captured_events: Option<u64>,
     index: Option<usize>,
     _capture: PhantomData<fn() -> T>,
 }
@@ -613,21 +753,32 @@ impl<H: Borrow<crate::Async<T>> + Clone, T> Future for Ready<H, T> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let Self {
             ref handle,
+            wake_mode,
             dir,
             ticks,
+            // Only read in the `WakeMode::Edge` arms below, which are themselves Windows-only.
+            #[cfg_attr(not(windows), allow(unused_variables))]
+            captured_events,
             index,
             ..
         } = &mut *self;
 
         let mut state = handle.borrow().source.state.lock().unwrap();
 
-        // Check if the reactor has delivered an event.
-        if let Some((a, b)) = *ticks {
-            // If `state[dir].tick` has changed to a value other than the old reactor tick,
-            // that means a newer reactor tick has delivered an event.
-            if state[*dir].tick != a && state[*dir].tick != b {
-                return Poll::Ready(Ok(()));
-            }
+        // Check if the reactor has delivered an event since registration.
+        let ready = match *wake_mode {
+            WakeMode::Level => match *ticks {
+                Some((a, b)) => state[*dir].tick != a && state[*dir].tick != b,
+                None => false,
+            },
+            #[cfg(windows)]
+            WakeMode::Edge => match *captured_events {
+                Some(captured) => state[*dir].events != captured,
+                None => false,
+            },
+        };
+        if ready {
+            return Poll::Ready(Ok(()));
         }
 
         let was_empty = state[*dir].is_empty();
@@ -638,7 +789,15 @@ impl<H: Borrow<crate::Async<T>> + Clone, T> Future for Ready<H, T> {
             None => {
                 let i = state[*dir].wakers.insert(None);
                 *index = Some(i);
-                *ticks = Some((Reactor::get().ticker(), state[*dir].tick));
+                match *wake_mode {
+                    WakeMode::Level => {
+                        *ticks = Some((Reactor::get().ticker(), state[*dir].tick));
+                    }
+                    #[cfg(windows)]
+                    WakeMode::Edge => {
+                        *captured_events = Some(state[*dir].events);
+                    }
+                }
                 i
             }
         };
@@ -676,5 +835,177 @@ impl<H: Borrow<crate::Async<T>>, T> Drop for Ready<H, T> {
                 wakers.remove(key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ready_tests {
+    //! Unit tests for the `WakeMode`-aware readiness logic in `Source::check_ready` /
+    //! `Source::capture`. These exercise the pure state-machine and do not require any
+    //! OS handle or running reactor.
+
+    use super::{Direction, Source, WakeMode};
+
+    /// Simulates a delivery from `ReactorLock::react()` for the given direction:
+    /// bumps the per-direction event counter and updates the last-delivery tick.
+    fn deliver(dir: &mut Direction, reactor_tick: usize) {
+        dir.tick = reactor_tick;
+        dir.events = dir.events.wrapping_add(1);
+    }
+
+    // ---- Level mode ----
+
+    #[test]
+    fn level_no_capture_is_not_ready() {
+        let dir = Direction::default();
+        assert!(!Source::check_ready(&dir, WakeMode::Level));
+    }
+
+    #[test]
+    fn level_no_delivery_after_capture_is_not_ready() {
+        let mut dir = Direction::default();
+        dir.tick = 5;
+        // Simulate registration at reactor ticker = 7, with last delivery tick 5.
+        dir.ticks = Some((7, 5));
+        assert!(!Source::check_ready(&dir, WakeMode::Level));
+    }
+
+    #[test]
+    fn level_delivery_after_capture_is_ready() {
+        let mut dir = Direction::default();
+        dir.tick = 5;
+        dir.ticks = Some((7, 5));
+        // Reactor advances and delivers our event at tick 9.
+        deliver(&mut dir, 9);
+        assert!(Source::check_ready(&dir, WakeMode::Level));
+    }
+
+    #[test]
+    fn level_same_cycle_delivery_is_not_detected() {
+        // Documents existing level-mode behavior: if delivery happens in the same
+        // reactor cycle whose ticker we captured (`dir.tick == a`), level mode does
+        // NOT report ready. This is acceptable for level sources because they keep
+        // re-firing on every subsequent react() pass.
+        let mut dir = Direction::default();
+        dir.tick = 5;
+        dir.ticks = Some((7, 5));
+        deliver(&mut dir, 7); // tick == a
+        assert!(!Source::check_ready(&dir, WakeMode::Level));
+    }
+
+    // ---- Edge mode ----
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_no_capture_is_not_ready() {
+        let dir = Direction::default();
+        assert!(!Source::check_ready(&dir, WakeMode::Edge));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_no_delivery_after_capture_is_not_ready() {
+        let mut dir = Direction::default();
+        dir.events = 3;
+        Source::capture(&mut dir, WakeMode::Edge);
+        assert_eq!(dir.captured_events, Some(3));
+        assert!(!Source::check_ready(&dir, WakeMode::Edge));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_delivery_after_capture_is_ready() {
+        let mut dir = Direction::default();
+        dir.events = 3;
+        Source::capture(&mut dir, WakeMode::Edge);
+        deliver(&mut dir, 42);
+        assert!(Source::check_ready(&dir, WakeMode::Edge));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_same_cycle_delivery_is_detected() {
+        // Regression: previously the edge path used `state.tick == a` to catch the
+        // same-cycle race. With the per-direction event counter, delivery is detected
+        // unambiguously regardless of how the reactor tick aliases.
+        let mut dir = Direction::default();
+        dir.tick = 7; // last-delivery tick happens to equal current reactor ticker
+        dir.events = 1;
+        Source::capture(&mut dir, WakeMode::Edge);
+        // Delivery in the same cycle: reactor tick stays 7, but events advances.
+        deliver(&mut dir, 7);
+        assert!(Source::check_ready(&dir, WakeMode::Edge));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_no_spurious_ready_when_tick_equals_capture() {
+        // Regression for the bug fixed by this change: the previous edge logic
+        // returned `Ready` whenever `state.tick == a`, even when no delivery had
+        // occurred. The most concrete impact was the drain loop in
+        // `NamedPipeStream::poll_read`, which would busy-loop forever whenever
+        // `state.tick == reactor.ticker` happened to hold at registration time.
+        //
+        // With the counter-based check, a capture taken when `dir.tick` equals the
+        // reactor ticker must NOT be reported as ready until a real delivery
+        // increments `dir.events`.
+        let mut dir = Direction::default();
+        dir.tick = 7;
+        dir.events = 1;
+        Source::capture(&mut dir, WakeMode::Edge);
+        // No delivery yet -- not ready.
+        assert!(!Source::check_ready(&dir, WakeMode::Edge));
+        // Spurious wake (no delivery): a tight drain loop would re-check, must still
+        // observe "not ready".
+        for _ in 0..1000 {
+            assert!(!Source::check_ready(&dir, WakeMode::Edge));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_each_delivery_consumed_exactly_once() {
+        // Each call sequence (capture -> deliver -> check_ready -> consume) must
+        // report ready exactly once per delivery.
+        let mut dir = Direction::default();
+        for n in 1..=10u64 {
+            Source::capture(&mut dir, WakeMode::Edge);
+            assert!(!Source::check_ready(&dir, WakeMode::Edge));
+            deliver(&mut dir, n as usize);
+            assert!(Source::check_ready(&dir, WakeMode::Edge));
+            // Consume: clear capture (mirrors what poll_ready does on Ready).
+            dir.captured_events = None;
+            assert!(!Source::check_ready(&dir, WakeMode::Edge));
+        }
+        assert_eq!(dir.events, 10);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_capture_clears_level_state_and_vice_versa() {
+        let mut dir = Direction::default();
+        dir.tick = 3;
+        dir.events = 4;
+
+        Source::capture(&mut dir, WakeMode::Level);
+        assert!(dir.ticks.is_some());
+        assert!(dir.captured_events.is_none());
+
+        Source::capture(&mut dir, WakeMode::Edge);
+        assert!(dir.ticks.is_none());
+        assert_eq!(dir.captured_events, Some(4));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_counter_wraps_without_panic() {
+        // Wrapping is fine: the only operation we do is equality, which is safe
+        // around a wrap. The test documents the intent.
+        let mut dir = Direction::default();
+        dir.events = u64::MAX;
+        Source::capture(&mut dir, WakeMode::Edge);
+        deliver(&mut dir, 0); // wraps to 0
+        assert_eq!(dir.events, 0);
+        assert!(Source::check_ready(&dir, WakeMode::Edge));
     }
 }

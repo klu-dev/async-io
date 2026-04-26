@@ -14,8 +14,20 @@ keywords = ["mio", "epoll", "kqueue", "iocp"]
 categories = ["asynchronous", "network-programming", "os"]
 exclude = ["/.*"]
 
+[features]
+default = []
+# Enables `compio_io::AsyncRead` / `compio_io::AsyncWrite` impls on
+# `NamedPipeStream` and re-exports the `compio-io` / `compio-buf`
+# trait crates from `async_io::os::windows::compio`. Windows-only:
+# enabling on non-Windows targets compiles cleanly but adds no
+# public items.
+compio = ["dep:compio-io", "dep:compio-buf"]
+
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(polling_test_poll_backend)', 'cfg(async_io_no_pipe)' ] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(polling_test_poll_backend)',
+    'cfg(async_io_no_pipe)',
+] }
 
 [[bench]]
 name = "io"
@@ -28,16 +40,32 @@ harness = false
 [dependencies]
 cfg-if = "1"
 concurrent-queue = "2.2.0"
-futures-io = { version = "0.3.28", default-features = false, features = ["std"] }
+futures-io = { version = "0.3.28", default-features = false, features = [
+    "std",
+] }
 futures-lite = { version = "2.0.0", default-features = false }
 parking = "2.0.0"
-polling = "3.4.0"
-rustix = { version = "1.0.7", default-features = false, features = ["fs", "net", "std"] }
+polling = { git = "https://github.com/klu-dev/polling", branch = "kail/windows_file" }
+rustix = { version = "1.0.7", default-features = false, features = [
+    "fs",
+    "net",
+    "std",
+] }
 slab = "0.4.2"
 tracing = { version = "0.1.37", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+blocking = "1"
+compio-io = { version = "0.9.1", default-features = false, optional = true }
+compio-buf = { version = "0.8", default-features = false, optional = true }
 
 [build-dependencies]
 autocfg = "1"
@@ -46,10 +74,18 @@ autocfg = "1"
 async-channel = "2.0.0"
 async-net = "2.0.0"
 blocking = "1"
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.7", default-features = false, features = [
+    "cargo_bench_support",
+] }
 getrandom = "0.3"
 signal-hook = "0.3"
 tempfile = "3"
+fastrand = "2.0.0"
+tracing = { version = "0.1.37", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "env-filter",
+    "fmt",
+] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 inotify = { version = "0.11.0", default-features = false }
